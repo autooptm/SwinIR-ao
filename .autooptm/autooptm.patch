@@ -1,0 +1,238 @@
+diff --git a/main_test_swinir.py b/main_test_swinir.py
+index f06b5f3..6d42c1a 100644
+--- a/main_test_swinir.py
++++ b/main_test_swinir.py
+@@ -8,6 +8,7 @@ import torch
+ import requests
+ 
+ from models.network_swinir import SwinIR as net
++from models.network_swinir import RSTB, WindowAttention
+ from utils import util_calculate_psnr_ssim as util
+ 
+ 
+@@ -28,6 +29,9 @@ def main():
+     parser.add_argument('--folder_gt', type=str, default=None, help='input ground-truth test image folder')
+     parser.add_argument('--tile', type=int, default=None, help='Tile size, None for no tile during testing (testing as a whole)')
+     parser.add_argument('--tile_overlap', type=int, default=32, help='Overlapping of different tiles')
++    parser.add_argument('--no_opt_a', action='store_true', help='turn off optimization a (default: on)')
++    parser.add_argument('--no_opt_b', action='store_true', help='turn off optimization b (default: on)')
++    parser.add_argument('--no_opt_c', action='store_true', help='turn off optimization c (default: on)')
+     args = parser.parse_args()
+ 
+     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+@@ -44,6 +48,11 @@ def main():
+     model = define_model(args)
+     model.eval()
+     model = model.to(device)
++    if device.type == 'cuda' and not args.no_opt_b:
++        RSTB.forward = torch.compile(RSTB.forward)
++        WindowAttention.opt_3 = True
++    opt_1 = device.type == 'cuda' and not args.no_opt_a
++    opt_2 = device.type == 'cuda' and not args.no_opt_c
+ 
+     # setup folder and path
+     folder, save_dir, border, window_size = setup(args)
+@@ -71,7 +80,8 @@ def main():
+             w_pad = (w_old // window_size + 1) * window_size - w_old
+             img_lq = torch.cat([img_lq, torch.flip(img_lq, [2])], 2)[:, :, :h_old + h_pad, :]
+             img_lq = torch.cat([img_lq, torch.flip(img_lq, [3])], 3)[:, :, :, :w_old + w_pad]
+-            output = test(img_lq, model, args, window_size)
++            with torch.autocast('cuda', dtype=torch.bfloat16, enabled=opt_1):
++                output = test(img_lq, model, args, window_size)
+             output = output[..., :h_old * args.scale, :w_old * args.scale]
+ 
+         # save image
+@@ -87,13 +97,19 @@ def main():
+             img_gt = img_gt[:h_old * args.scale, :w_old * args.scale, ...]  # crop gt
+             img_gt = np.squeeze(img_gt)
+ 
+-            psnr = util.calculate_psnr(output, img_gt, crop_border=border)
+-            ssim = util.calculate_ssim(output, img_gt, crop_border=border)
++            if opt_2:
++                psnr, ssim, *metrics_y = util.opt_7(output, img_gt, crop_border=border, device=device)
++            else:
++                psnr = util.calculate_psnr(output, img_gt, crop_border=border)
++                ssim = util.calculate_ssim(output, img_gt, crop_border=border)
+             test_results['psnr'].append(psnr)
+             test_results['ssim'].append(ssim)
+             if img_gt.ndim == 3:  # RGB image
+-                psnr_y = util.calculate_psnr(output, img_gt, crop_border=border, test_y_channel=True)
+-                ssim_y = util.calculate_ssim(output, img_gt, crop_border=border, test_y_channel=True)
++                if opt_2:
++                    psnr_y, ssim_y = metrics_y
++                else:
++                    psnr_y = util.calculate_psnr(output, img_gt, crop_border=border, test_y_channel=True)
++                    ssim_y = util.calculate_ssim(output, img_gt, crop_border=border, test_y_channel=True)
+                 test_results['psnr_y'].append(psnr_y)
+                 test_results['ssim_y'].append(ssim_y)
+             if args.task in ['jpeg_car', 'color_jpeg_car']:
+@@ -188,6 +204,9 @@ def define_model(args):
+ 
+     pretrained_model = torch.load(args.model_path)
+     model.load_state_dict(pretrained_model[param_key_g] if param_key_g in pretrained_model.keys() else pretrained_model, strict=True)
++    for m in model.modules():
++        if isinstance(m, WindowAttention):
++            m.opt_5()
+ 
+     return model
+ 
+diff --git a/models/network_swinir.py b/models/network_swinir.py
+index 461fb35..e18f4d0 100644
+--- a/models/network_swinir.py
++++ b/models/network_swinir.py
+@@ -30,6 +30,9 @@ class Mlp(nn.Module):
+         return x
+ 
+ 
++_OPT_4 = {}
++
++
+ def window_partition(x, window_size):
+     """
+     Args:
+@@ -76,6 +79,8 @@ class WindowAttention(nn.Module):
+         proj_drop (float, optional): Dropout ratio of output. Default: 0.0
+     """
+ 
++    opt_3 = False
++
+     def __init__(self, dim, window_size, num_heads, qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0.):
+ 
+         super().__init__()
+@@ -121,12 +126,32 @@ class WindowAttention(nn.Module):
+         qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+         q, k, v = qkv[0], qkv[1], qkv[2]  # make torchscript happy (cannot use tensor as tuple)
+ 
++        if self.opt_3 and not self.training:
++            from torch.nn.attention.flex_attention import flex_attention
++            rpb = getattr(self, 'relative_position_bias_cache', None)
++            bias = (rpb if rpb is not None else self.get_relative_position_bias()).to(q.dtype)
++            if mask is not None:
++                nW = mask.shape[0]
++                mk = mask.to(q.dtype)
++
++                def score_mod(score, b, h, qi, ki):
++                    return score + bias[h, qi, ki] + mk[b % nW, qi, ki]
++            else:
++                def score_mod(score, b, h, qi, ki):
++                    return score + bias[h, qi, ki]
++            x = flex_attention(q, k, v, score_mod=score_mod, scale=self.scale).transpose(1, 2).reshape(B_, N, C)
++            x = self.proj(x)
++            x = self.proj_drop(x)
++            return x
++
+         q = q * self.scale
+         attn = (q @ k.transpose(-2, -1))
+ 
+-        relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
+-            self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)  # Wh*Ww,Wh*Ww,nH
+-        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
++        rpb = getattr(self, 'relative_position_bias_cache', None)
++        if rpb is not None and not self.training:
++            relative_position_bias = rpb
++        else:
++            relative_position_bias = self.get_relative_position_bias()
+         attn = attn + relative_position_bias.unsqueeze(0)
+ 
+         if mask is not None:
+@@ -144,6 +169,16 @@ class WindowAttention(nn.Module):
+         x = self.proj_drop(x)
+         return x
+ 
++    def get_relative_position_bias(self):
++        relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
++            self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)  # Wh*Ww,Wh*Ww,nH
++        return relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
++
++    @torch.no_grad()
++    def opt_5(self):
++        # call after the weights are loaded; a non-persistent buffer follows .to(device)
++        self.register_buffer('relative_position_bias_cache', self.get_relative_position_bias().clone(), persistent=False)
++
+     def extra_repr(self) -> str:
+         return f'dim={self.dim}, window_size={self.window_size}, num_heads={self.num_heads}'
+ 
+@@ -236,6 +271,16 @@ class SwinTransformerBlock(nn.Module):
+ 
+         return attn_mask
+ 
++    def opt_6(self, x_size, device):
++        if self.shift_size == 0:
++            return None  # no shift: calculate_mask is all zeros, adding it is exact +0
++        key = (tuple(x_size), self.window_size, self.shift_size, str(device))
++        mask = _OPT_4.get(key)
++        if mask is None:
++            mask = self.calculate_mask(x_size).to(device)
++            _OPT_4[key] = mask
++        return mask
++
+     def forward(self, x, x_size):
+         H, W = x_size
+         B, L, C = x.shape
+@@ -259,7 +304,7 @@ class SwinTransformerBlock(nn.Module):
+         if self.input_resolution == x_size:
+             attn_windows = self.attn(x_windows, mask=self.attn_mask)  # nW*B, window_size*window_size, C
+         else:
+-            attn_windows = self.attn(x_windows, mask=self.calculate_mask(x_size).to(x.device))
++            attn_windows = self.attn(x_windows, mask=self.opt_6(x_size, x.device))
+ 
+         # merge windows
+         attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
+diff --git a/utils/util_calculate_psnr_ssim.py b/utils/util_calculate_psnr_ssim.py
+index 1a8fb27..de74556 100644
+--- a/utils/util_calculate_psnr_ssim.py
++++ b/utils/util_calculate_psnr_ssim.py
+@@ -344,3 +344,53 @@ def bgr2ycbcr(img, y_only=False):
+             img, [[24.966, 112.0, -18.214], [128.553, -74.203, -93.786], [65.481, -37.797, 112.0]]) + [16, 128, 128]
+     out_img = _convert_output_type_range(out_img, img_type)
+     return out_img
++
++
++@torch.no_grad()
++def opt_7(img1, img2, crop_border, device):
++    """PSNR and SSIM (and PSNR_Y / SSIM_Y for 3-channel images) of two HWC uint8 images, computed on `device`
++    in float64 with the same formulas as calculate_psnr / calculate_ssim / to_y_channel. Each image is uploaded and
++    converted to Y once for all four metrics.
++
++    Returns:
++        (psnr, ssim) for single-channel images, (psnr, ssim, psnr_y, ssim_y) otherwise.
++    """
++    assert img1.shape == img2.shape, (f'Image shapes are differnet: {img1.shape}, {img2.shape}.')
++    with torch.autocast(device.type, enabled=False):
++        a = torch.from_numpy(np.ascontiguousarray(reorder_image(img1))).to(device).double()
++        b = torch.from_numpy(np.ascontiguousarray(reorder_image(img2))).to(device).double()
++        if crop_border != 0:
++            a = a[crop_border:-crop_border, crop_border:-crop_border, ...]
++            b = b[crop_border:-crop_border, crop_border:-crop_border, ...]
++        k = torch.from_numpy(cv2.getGaussianKernel(11, 1.5)).to(device=device, dtype=torch.float64).view(-1)
++
++        def psnr(x, y):
++            mse = torch.mean((x - y) ** 2).item()
++            return float('inf') if mse == 0 else 20. * np.log10(255. / np.sqrt(mse))
++
++        def ssim(x, y):
++            # _ssim per channel, then the mean over channels; the Gaussian window is outer(k, k), so
++            # filter2D + [5:-5, 5:-5] is two 'valid' 1-D convolutions
++            C1 = (0.01 * 255)**2
++            C2 = (0.03 * 255)**2
++            x = x.double().permute(2, 0, 1)[:, None]
++            y = y.double().permute(2, 0, 1)[:, None]
++            s = torch.cat([x, y, x * x, y * y, x * y], 1)
++            c, h, w = s.shape[0], s.shape[-2], s.shape[-1]
++            s = s.reshape(c * 5, 1, h, w)
++            s = torch.nn.functional.conv2d(torch.nn.functional.conv2d(s, k.view(1, 1, 1, 11)), k.view(1, 1, 11, 1))
++            mu1, mu2, e11, e22, e12 = s.view(c, 5, h - 10, w - 10).unbind(1)
++            mu1_sq, mu2_sq, mu1_mu2 = mu1**2, mu2**2, mu1 * mu2
++            m = ((2 * mu1_mu2 + C1) * (2 * (e12 - mu1_mu2) + C2)) / ((mu1_sq + mu2_sq + C1) *
++                                                                    ((e11 - mu1_sq) + (e22 - mu2_sq) + C2))
++            return m.mean(dim=(1, 2)).mean().item()
++
++        out = (psnr(a, b), ssim(a, b))
++        if a.shape[2] == 3:
++            coef = torch.tensor([24.966, 128.553, 65.481], dtype=torch.float64, device=device)
++
++            def to_y(x):
++                return ((((x.float() / 255.).double() @ coef + 16.) / 255.).float() * 255.)[..., None]
++            ay, by = to_y(a), to_y(b)
++            out = out + (psnr(ay, by), ssim(ay, by))
++        return out

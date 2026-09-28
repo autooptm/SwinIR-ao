@@ -8,6 +8,7 @@ import torch
 import requests
 
 from models.network_swinir import SwinIR as net
+from models.network_swinir import RSTB, WindowAttention
 from utils import util_calculate_psnr_ssim as util
 
 
@@ -28,6 +29,9 @@ def main():
     parser.add_argument('--folder_gt', type=str, default=None, help='input ground-truth test image folder')
     parser.add_argument('--tile', type=int, default=None, help='Tile size, None for no tile during testing (testing as a whole)')
     parser.add_argument('--tile_overlap', type=int, default=32, help='Overlapping of different tiles')
+    parser.add_argument('--no_opt_a', action='store_true', help='turn off optimization a (default: on)')
+    parser.add_argument('--no_opt_b', action='store_true', help='turn off optimization b (default: on)')
+    parser.add_argument('--no_opt_c', action='store_true', help='turn off optimization c (default: on)')
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -44,6 +48,11 @@ def main():
     model = define_model(args)
     model.eval()
     model = model.to(device)
+    if device.type == 'cuda' and not args.no_opt_b:
+        RSTB.forward = torch.compile(RSTB.forward)
+        WindowAttention.opt_3 = True
+    opt_1 = device.type == 'cuda' and not args.no_opt_a
+    opt_2 = device.type == 'cuda' and not args.no_opt_c
 
     # setup folder and path
     folder, save_dir, border, window_size = setup(args)
@@ -71,7 +80,8 @@ def main():
             w_pad = (w_old // window_size + 1) * window_size - w_old
             img_lq = torch.cat([img_lq, torch.flip(img_lq, [2])], 2)[:, :, :h_old + h_pad, :]
             img_lq = torch.cat([img_lq, torch.flip(img_lq, [3])], 3)[:, :, :, :w_old + w_pad]
-            output = test(img_lq, model, args, window_size)
+            with torch.autocast('cuda', dtype=torch.bfloat16, enabled=opt_1):
+                output = test(img_lq, model, args, window_size)
             output = output[..., :h_old * args.scale, :w_old * args.scale]
 
         # save image
@@ -87,13 +97,19 @@ def main():
             img_gt = img_gt[:h_old * args.scale, :w_old * args.scale, ...]  # crop gt
             img_gt = np.squeeze(img_gt)
 
-            psnr = util.calculate_psnr(output, img_gt, crop_border=border)
-            ssim = util.calculate_ssim(output, img_gt, crop_border=border)
+            if opt_2:
+                psnr, ssim, *metrics_y = util.opt_7(output, img_gt, crop_border=border, device=device)
+            else:
+                psnr = util.calculate_psnr(output, img_gt, crop_border=border)
+                ssim = util.calculate_ssim(output, img_gt, crop_border=border)
             test_results['psnr'].append(psnr)
             test_results['ssim'].append(ssim)
             if img_gt.ndim == 3:  # RGB image
-                psnr_y = util.calculate_psnr(output, img_gt, crop_border=border, test_y_channel=True)
-                ssim_y = util.calculate_ssim(output, img_gt, crop_border=border, test_y_channel=True)
+                if opt_2:
+                    psnr_y, ssim_y = metrics_y
+                else:
+                    psnr_y = util.calculate_psnr(output, img_gt, crop_border=border, test_y_channel=True)
+                    ssim_y = util.calculate_ssim(output, img_gt, crop_border=border, test_y_channel=True)
                 test_results['psnr_y'].append(psnr_y)
                 test_results['ssim_y'].append(ssim_y)
             if args.task in ['jpeg_car', 'color_jpeg_car']:
@@ -188,6 +204,9 @@ def define_model(args):
 
     pretrained_model = torch.load(args.model_path)
     model.load_state_dict(pretrained_model[param_key_g] if param_key_g in pretrained_model.keys() else pretrained_model, strict=True)
+    for m in model.modules():
+        if isinstance(m, WindowAttention):
+            m.opt_5()
 
     return model
 

@@ -1,3 +1,65 @@
+<div align="center">
+  <a href="https://autooptm.com"><img src=".autooptm/logo.png" width="96" alt="AutoOptm"></a>
+
+  <h1>SwinIR · optimized by <a href="https://autooptm.com">AutoOptm</a></h1>
+
+  <p><b>13.15x faster end to end</b> on the command below, output verified against the stock program.</p>
+
+  <p>
+    <a href="https://autooptm.com"><img alt="speedup" src="https://img.shields.io/badge/end--to--end-13.15x-2ea44f"></a>
+    <a href="https://github.com/JingyunLiang/SwinIR/commit/6545850fbf8df298df73d81f3e8cba638787c8bd"><img alt="base" src="https://img.shields.io/badge/upstream-6545850fbf8d-blue"></a>
+    <img alt="card" src="https://img.shields.io/badge/measured%20on-RTX%204090-lightgrey">
+  </p>
+</div>
+
+> This is a fork of [JingyunLiang/SwinIR](https://github.com/JingyunLiang/SwinIR) at commit
+> [`6545850fbf8d`](https://github.com/JingyunLiang/SwinIR/commit/6545850fbf8df298df73d81f3e8cba638787c8bd) with the AutoOptm patch applied on top.
+> The optimisation was found, measured and verified automatically by [AutoOptm](https://autooptm.com);
+> the patch is also kept at [`.autooptm/autooptm.patch`](.autooptm/autooptm.patch).
+
+## The result
+
+| | |
+|---|---|
+| **Command** | `python main_test_swinir.py --task color_dn --noise 15 --model_path model_zoo/swinir/005_colorDN_DFWB_s128w8_SwinIR-M_noise15.pth --folder_gt testsets/McMaster` |
+| **Entry point** | `main_test_swinir.py` |
+| **Unit measured** | one McMaster test image: read → add noise → SwinIR-M colour denoising (noise 15) → PNG written to disk → PSNR/SSIM |
+| **Before (stock)** | 3,097 ms per unit (58.0 s for the timed image loop) |
+| **After (this tree, all switches default ON)** | 243 ms per unit (4.41 s for the timed image loop; a one-time warm-up of ~53 s when the process starts, 6 s for stock, is not included) |
+| **Speedup** | **13.15x** end to end on RTX 4090, noise floor of the host 1.3% |
+| **Output** | every output PNG within 2 uint8 levels of the stock program's (99% of pixels within 1 level), PSNR 56.5 dB against it; the program's own PSNR against ground truth (~35.6 dB) moves by at most ~0.01 dB; verified on the pinned inputs and on a held-out set the optimiser never saw |
+
+### What changed
+
+| File | Where | Gain (alone) |
+|---|---|---|
+| `models/network_swinir.py` | SwinTransformerBlock.opt_6 / forward | 2.97x |
+| `models/network_swinir.py` | WindowAttention.opt_5 / forward | 1.025x |
+| `models/network_swinir.py` | WindowAttention.forward | 1.014x |
+| `main_test_swinir.py` | main() -- model setup | 1.37x |
+| `main_test_swinir.py` | main() -- per-image forward | 1.29x |
+| `main_test_swinir.py` | main() -- per-image metrics | 1.215x |
+| `main_test_swinir.py` | define_model() | 1.025x |
+| `utils/util_calculate_psnr_ssim.py` | opt_7() (new) | 1.215x |
+
+## Reproduce
+
+```bash
+git clone https://github.com/autooptm/SwinIR-ao.git
+cd SwinIR-ao
+# set up exactly as upstream documents (the model in model_zoo/swinir/, McMaster in testsets/McMaster), then:
+python main_test_swinir.py --task color_dn --noise 15 --model_path model_zoo/swinir/005_colorDN_DFWB_s128w8_SwinIR-M_noise15.pth --folder_gt testsets/McMaster
+```
+
+The diff against upstream is one commit: `git log -1 -p` shows it, and
+`git diff 6545850fbf8d` is the same patch as `.autooptm/autooptm.patch`.
+
+---
+
+<div align="center"><sub>Optimized by <a href="https://autooptm.com">AutoOptm</a> — point it at a repository, get back a verified speedup and the patch.</sub></div>
+
+---
+
 # SwinIR: Image Restoration Using Swin Transformer
 [Jingyun Liang](https://jingyunliang.github.io), [Jiezhang Cao](https://www.jiezhangcao.com/), [Guolei Sun](https://vision.ee.ethz.ch/people-details.MjYzMjMw.TGlzdC8zMjg5LC0xOTcxNDY1MTc4.html), [Kai Zhang](https://cszn.github.io/), [Luc Van Gool](https://scholar.google.com/citations?user=TwMib_QAAAAJ&hl=en), [Radu Timofte](http://people.ee.ethz.ch/~timofter/)
 

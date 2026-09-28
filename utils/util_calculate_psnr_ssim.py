@@ -344,3 +344,53 @@ def bgr2ycbcr(img, y_only=False):
             img, [[24.966, 112.0, -18.214], [128.553, -74.203, -93.786], [65.481, -37.797, 112.0]]) + [16, 128, 128]
     out_img = _convert_output_type_range(out_img, img_type)
     return out_img
+
+
+@torch.no_grad()
+def opt_7(img1, img2, crop_border, device):
+    """PSNR and SSIM (and PSNR_Y / SSIM_Y for 3-channel images) of two HWC uint8 images, computed on `device`
+    in float64 with the same formulas as calculate_psnr / calculate_ssim / to_y_channel. Each image is uploaded and
+    converted to Y once for all four metrics.
+
+    Returns:
+        (psnr, ssim) for single-channel images, (psnr, ssim, psnr_y, ssim_y) otherwise.
+    """
+    assert img1.shape == img2.shape, (f'Image shapes are differnet: {img1.shape}, {img2.shape}.')
+    with torch.autocast(device.type, enabled=False):
+        a = torch.from_numpy(np.ascontiguousarray(reorder_image(img1))).to(device).double()
+        b = torch.from_numpy(np.ascontiguousarray(reorder_image(img2))).to(device).double()
+        if crop_border != 0:
+            a = a[crop_border:-crop_border, crop_border:-crop_border, ...]
+            b = b[crop_border:-crop_border, crop_border:-crop_border, ...]
+        k = torch.from_numpy(cv2.getGaussianKernel(11, 1.5)).to(device=device, dtype=torch.float64).view(-1)
+
+        def psnr(x, y):
+            mse = torch.mean((x - y) ** 2).item()
+            return float('inf') if mse == 0 else 20. * np.log10(255. / np.sqrt(mse))
+
+        def ssim(x, y):
+            # _ssim per channel, then the mean over channels; the Gaussian window is outer(k, k), so
+            # filter2D + [5:-5, 5:-5] is two 'valid' 1-D convolutions
+            C1 = (0.01 * 255)**2
+            C2 = (0.03 * 255)**2
+            x = x.double().permute(2, 0, 1)[:, None]
+            y = y.double().permute(2, 0, 1)[:, None]
+            s = torch.cat([x, y, x * x, y * y, x * y], 1)
+            c, h, w = s.shape[0], s.shape[-2], s.shape[-1]
+            s = s.reshape(c * 5, 1, h, w)
+            s = torch.nn.functional.conv2d(torch.nn.functional.conv2d(s, k.view(1, 1, 1, 11)), k.view(1, 1, 11, 1))
+            mu1, mu2, e11, e22, e12 = s.view(c, 5, h - 10, w - 10).unbind(1)
+            mu1_sq, mu2_sq, mu1_mu2 = mu1**2, mu2**2, mu1 * mu2
+            m = ((2 * mu1_mu2 + C1) * (2 * (e12 - mu1_mu2) + C2)) / ((mu1_sq + mu2_sq + C1) *
+                                                                    ((e11 - mu1_sq) + (e22 - mu2_sq) + C2))
+            return m.mean(dim=(1, 2)).mean().item()
+
+        out = (psnr(a, b), ssim(a, b))
+        if a.shape[2] == 3:
+            coef = torch.tensor([24.966, 128.553, 65.481], dtype=torch.float64, device=device)
+
+            def to_y(x):
+                return ((((x.float() / 255.).double() @ coef + 16.) / 255.).float() * 255.)[..., None]
+            ay, by = to_y(a), to_y(b)
+            out = out + (psnr(ay, by), ssim(ay, by))
+        return out

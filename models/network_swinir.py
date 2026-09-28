@@ -30,6 +30,9 @@ class Mlp(nn.Module):
         return x
 
 
+_OPT_4 = {}
+
+
 def window_partition(x, window_size):
     """
     Args:
@@ -76,6 +79,8 @@ class WindowAttention(nn.Module):
         proj_drop (float, optional): Dropout ratio of output. Default: 0.0
     """
 
+    opt_3 = False
+
     def __init__(self, dim, window_size, num_heads, qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0.):
 
         super().__init__()
@@ -121,12 +126,32 @@ class WindowAttention(nn.Module):
         qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]  # make torchscript happy (cannot use tensor as tuple)
 
+        if self.opt_3 and not self.training:
+            from torch.nn.attention.flex_attention import flex_attention
+            rpb = getattr(self, 'relative_position_bias_cache', None)
+            bias = (rpb if rpb is not None else self.get_relative_position_bias()).to(q.dtype)
+            if mask is not None:
+                nW = mask.shape[0]
+                mk = mask.to(q.dtype)
+
+                def score_mod(score, b, h, qi, ki):
+                    return score + bias[h, qi, ki] + mk[b % nW, qi, ki]
+            else:
+                def score_mod(score, b, h, qi, ki):
+                    return score + bias[h, qi, ki]
+            x = flex_attention(q, k, v, score_mod=score_mod, scale=self.scale).transpose(1, 2).reshape(B_, N, C)
+            x = self.proj(x)
+            x = self.proj_drop(x)
+            return x
+
         q = q * self.scale
         attn = (q @ k.transpose(-2, -1))
 
-        relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
-            self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)  # Wh*Ww,Wh*Ww,nH
-        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
+        rpb = getattr(self, 'relative_position_bias_cache', None)
+        if rpb is not None and not self.training:
+            relative_position_bias = rpb
+        else:
+            relative_position_bias = self.get_relative_position_bias()
         attn = attn + relative_position_bias.unsqueeze(0)
 
         if mask is not None:
@@ -143,6 +168,16 @@ class WindowAttention(nn.Module):
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
+
+    def get_relative_position_bias(self):
+        relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
+            self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)  # Wh*Ww,Wh*Ww,nH
+        return relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
+
+    @torch.no_grad()
+    def opt_5(self):
+        # call after the weights are loaded; a non-persistent buffer follows .to(device)
+        self.register_buffer('relative_position_bias_cache', self.get_relative_position_bias().clone(), persistent=False)
 
     def extra_repr(self) -> str:
         return f'dim={self.dim}, window_size={self.window_size}, num_heads={self.num_heads}'
@@ -236,6 +271,16 @@ class SwinTransformerBlock(nn.Module):
 
         return attn_mask
 
+    def opt_6(self, x_size, device):
+        if self.shift_size == 0:
+            return None  # no shift: calculate_mask is all zeros, adding it is exact +0
+        key = (tuple(x_size), self.window_size, self.shift_size, str(device))
+        mask = _OPT_4.get(key)
+        if mask is None:
+            mask = self.calculate_mask(x_size).to(device)
+            _OPT_4[key] = mask
+        return mask
+
     def forward(self, x, x_size):
         H, W = x_size
         B, L, C = x.shape
@@ -259,7 +304,7 @@ class SwinTransformerBlock(nn.Module):
         if self.input_resolution == x_size:
             attn_windows = self.attn(x_windows, mask=self.attn_mask)  # nW*B, window_size*window_size, C
         else:
-            attn_windows = self.attn(x_windows, mask=self.calculate_mask(x_size).to(x.device))
+            attn_windows = self.attn(x_windows, mask=self.opt_6(x_size, x.device))
 
         # merge windows
         attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
